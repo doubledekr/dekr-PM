@@ -21,6 +21,19 @@ service cloud.firestore {
       allow read, write: if isSignedIn() && get(/databases/$(database)/documents/projects/$(projectId)).data.ownerId == request.auth.uid;
     }
 
+    // Predictions: users create their own; everyone can read for consensus
+    match /predictions/{predictionId} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn() && request.resource.data.userId == request.auth.uid;
+      allow update, delete: if isSignedIn() && resource.data.userId == request.auth.uid;
+    }
+
+    // Asset snapshots: read-only for charts
+    match /asset_snapshots/{snapshotId} {
+      allow read: if isSignedIn();
+      allow write: if false; // Only Functions can write
+    }
+
     // Lock everything else
     match /{document=**} { allow read, write: if false; }
   }

@@ -17,6 +17,8 @@ export interface Task {
   createdAt: Date;
   updatedAt: Date;
   priority?: "low" | "medium" | "high";
+  status?: "todo" | "doing" | "done";
+  attachments?: Array<{ name: string; url: string }>;
 }
 
 export interface ProjectWithTaskCount extends Project {

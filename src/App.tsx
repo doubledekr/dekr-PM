@@ -1,10 +1,8 @@
 import { useEffect } from "react";
-import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
+import { Outlet } from "react-router-dom";
 import { collection, addDoc, serverTimestamp } from "firebase/firestore";
 import { auth, db } from "./firebaseClient";
 import { signInAnonymously } from "firebase/auth";
-import ProjectList from "./components/ProjectList";
-import ProjectDetail from "./components/ProjectDetail";
 import "./App.css";
 
 export default function App() {
@@ -57,12 +55,8 @@ export default function App() {
   }, []);
 
   return (
-    <BrowserRouter>
-      <Routes>
-        <Route path="/" element={<ProjectList />} />
-        <Route path="/project/:projectId" element={<ProjectDetail />} />
-        <Route path="*" element={<Navigate to="/" replace />} />
-      </Routes>
-    </BrowserRouter>
+    <div className="app-container">
+      <Outlet />
+    </div>
   );
 }
