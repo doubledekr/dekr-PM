@@ -57,6 +57,23 @@ export default function App() {
   return (
     <div className="app-container">
       <Outlet />
+      <footer
+        style={{
+          marginTop: 60,
+          padding: 24,
+          textAlign: "center",
+          fontSize: "0.85em",
+          color: "rgba(255,255,255,0.6)",
+          borderTop: "1px solid #333",
+        }}
+      >
+        <p style={{ margin: "8px 0" }}>
+          <strong>Disclaimer:</strong> User predictions are opinions, not investment advice.
+        </p>
+        <p style={{ margin: "8px 0" }}>
+          Past accuracy does not guarantee future performance. No trading or brokerage services.
+        </p>
+      </footer>
     </div>
   );
 }

@@ -86,6 +86,12 @@ export const createPrediction = functions.region('us-central1').runWith({
 }).https.onCall(async (data: any, ctx: functions.https.CallableContext) => {
   if (!ctx.auth?.uid) throw new functions.https.HttpsError('unauthenticated', 'Login required');
 
+  // Gate: check if user has canPredict permission
+  const userSnap = await db.collection('users').doc(ctx.auth.uid).get();
+  if (!userSnap.exists || userSnap.get('canPredict') !== true) {
+    throw new functions.https.HttpsError('permission-denied', 'Predictor access required');
+  }
+
   const { asset, direction, horizon, targetLow = null, targetHigh = null, confidence = 3, compareSymbol = null } = data || {};
 
   if (!asset || !['up', 'down', 'outperform'].includes(direction) || !['24h', '7d', '30d'].includes(horizon)) {
@@ -122,7 +128,7 @@ export const createPrediction = functions.region('us-central1').runWith({
   return { id: ref.id, ...doc };
 });
 
-/** Grade due predictions - use close for 7d/30d; spot for 24h; supports outperform */
+/** Grade due predictions - use close for 7d/30d; spot for 24h; supports outperform (batched) */
 export const gradeDue = functions.region('us-central1').runWith({
   secrets: ['TWELVEDATA_API_KEY'],
 }).pubsub
@@ -133,40 +139,85 @@ export const gradeDue = functions.region('us-central1').runWith({
       .where('expiresAt', '<=', now)
       .limit(200).get();
 
-    const batch = db.batch();
+    if (snap.empty) return null;
 
-    for (const doc of snap.docs) {
-      const p = doc.data() as any;
+    // Batch price lookups to reduce API calls
+    const docs = snap.docs.map(d => ({ ref: d.ref, data: d.data() as any }));
+    const need = new Set<string>();
+    docs.forEach(p => {
+      need.add(p.data.asset);
+      if (p.data.direction === 'outperform' && p.data.compareSymbol) {
+        need.add(p.data.compareSymbol);
+      }
+    });
 
-      let endPrice: number;
+    // Group by horizon for efficient fetching
+    const priceCache = new Map<string, number>();
+
+    // Fetch prices - batch by horizon type
+    for (const sym of need) {
+      // Try to get a representative horizon/date for this symbol
+      const sampleDoc = docs.find(d => d.data.asset === sym || d.data.compareSymbol === sym);
+      if (!sampleDoc) continue;
+
+      const p = sampleDoc.data;
       if (p.horizon === '24h') {
-        endPrice = await tdFetchSpot(p.asset);
+        try {
+          const price = await tdFetchSpot(sym);
+          priceCache.set(sym, price);
+        } catch (err) {
+          console.error(`Failed to fetch spot for ${sym}:`, err);
+        }
       } else {
+        // For 7d/30d, use the expire date
         const ymd = new Date(p.expiresAt.toDate()).toISOString().slice(0, 10);
-        endPrice = await tdFetchCloseOn(p.asset, ymd);
+        try {
+          const price = await tdFetchCloseOn(sym, ymd);
+          priceCache.set(sym, price);
+        } catch (err) {
+          console.error(`Failed to fetch close for ${sym} on ${ymd}:`, err);
+        }
+      }
+    }
+
+    const batch = db.batch();
+    let gradedCount = 0;
+
+    for (const { ref, data: p } of docs) {
+      const endPrice = priceCache.get(p.asset);
+      if (endPrice === undefined) {
+        console.error(`No price cached for ${p.asset}`);
+        continue;
       }
 
       let won = false;
       if (p.direction === 'outperform' && p.compareSymbol) {
-        const startCmp = p.startCmpPrice ?? await tdFetchSpot(p.compareSymbol);
-        const endCmp = (p.horizon === '24h')
-          ? await tdFetchSpot(p.compareSymbol)
-          : await tdFetchCloseOn(p.compareSymbol, new Date(p.expiresAt.toDate()).toISOString().slice(0, 10));
+        const startCmp = p.startCmpPrice ?? priceCache.get(p.compareSymbol);
+        if (startCmp === undefined) {
+          console.error(`No comparison price for ${p.compareSymbol}`);
+          continue;
+        }
+        const endCmp = priceCache.get(p.compareSymbol);
+        if (endCmp === undefined) {
+          console.error(`No end comparison price for ${p.compareSymbol}`);
+          continue;
+        }
 
         const relStart = p.startPrice / startCmp;
         const relEnd = endPrice / endCmp;
         won = relEnd > relStart;
 
         if (!p.startCmpPrice) {
-          batch.update(doc.ref, { startCmpPrice: startCmp });
+          batch.update(ref, { startCmpPrice: startCmp });
         }
       } else {
         won = gradeDirection(p.direction, p.startPrice, endPrice);
       }
 
-      batch.update(doc.ref, { status: won ? 'won' : 'lost', endPrice, resolvedAt: now });
+      batch.update(ref, { status: won ? 'won' : 'lost', endPrice, resolvedAt: now });
+      gradedCount++;
 
-      // (Optional) cache snapshot for charts
+      // Cache snapshot for charts
       batch.create(db.collection('asset_snapshots').doc(), {
         asset: p.asset,
         price: endPrice,
@@ -175,5 +226,62 @@ export const gradeDue = functions.region('us-central1').runWith({
     }
 
     await batch.commit();
+
+    // Update stats
+    const statsRef = db.collection('stats').doc('global');
+    await statsRef.set({
+      graded_predictions_count: admin.firestore.FieldValue.increment(gradedCount),
+      lastGradedAt: now,
+    }, { merge: true });
+
+    return null;
   });
+
+/** Compute consensus for all assets across horizons */
+export const computeConsensus = functions.region('us-central1').runWith({
+  secrets: ['TWELVEDATA_API_KEY'],
+}).https.onRequest(async (_req, res) => {
+  const horizons = ['24h', '7d', '30d'];
+  
+  for (const h of horizons) {
+    const snap = await db.collection('predictions')
+      .where('status', '==', 'active')
+      .where('horizon', '==', h)
+      .get();
+
+    const bucket: Record<string, { up: number; down: number; conf: number; cnt: number; target: number[] }> = {};
+
+    snap.forEach(d => {
+      const p: any = d.data();
+      const b = bucket[p.asset] ?? (bucket[p.asset] = { up: 0, down: 0, conf: 0, cnt: 0, target: [] });
+      
+      if (p.direction === 'up') b.up++;
+      else if (p.direction === 'down') b.down++;
+      
+      b.conf += p.confidence ?? 3;
+      b.cnt++;
+      
+      if (p.targetLow && p.targetHigh) {
+        b.target.push((p.targetLow + p.targetHigh) / 2);
+      }
+    });
+
+    const batch = db.batch();
+    for (const [asset, v] of Object.entries(bucket)) {
+      batch.set(db.collection('asset_consensus').doc(`${asset}_${h}`), {
+        asset,
+        horizon: h,
+        upPct: v.cnt ? Math.round(100 * v.up / v.cnt) : 0,
+        downPct: v.cnt ? Math.round(100 * v.down / v.cnt) : 0,
+        avgConfidence: v.cnt ? Number((v.conf / v.cnt).toFixed(2)) : 0,
+        avgTarget: v.target.length ? Number((v.target.reduce((a, b) => a + b, 0) / v.target.length).toFixed(2)) : null,
+        computedAt: admin.firestore.Timestamp.now(),
+      });
+    }
+    
+    await batch.commit();
+  }
+
+  res.json({ ok: true });
+});
 

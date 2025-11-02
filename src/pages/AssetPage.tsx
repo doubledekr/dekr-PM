@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { useParams, Link } from "react-router-dom";
 import { db } from "../firebaseClient";
-import { collection, query, where, orderBy, onSnapshot } from "firebase/firestore";
+import { collection, query, where, orderBy, limit, onSnapshot } from "firebase/firestore";
 import type { Prediction } from "../api";
 
 export default function AssetPage() {
@@ -13,6 +13,7 @@ export default function AssetPage() {
     outperform: number;
     avgConfidence: number;
   } | null>(null);
+  const [points, setPoints] = useState<number[]>([]);
 
   useEffect(() => {
     if (!symbol) return;
@@ -47,6 +48,25 @@ export default function AssetPage() {
         outperform,
         avgConfidence: Math.round(avgConfidence * 10) / 10,
       });
+    });
+
+    return () => unsubscribe();
+  }, [symbol]);
+
+  // Load price snapshots for sparkline
+  useEffect(() => {
+    if (!symbol) return;
+
+    const snapshotsQuery = query(
+      collection(db, "asset_snapshots"),
+      where("asset", "==", symbol.toUpperCase()),
+      orderBy("ts", "desc"),
+      limit(50)
+    );
+
+    const unsubscribe = onSnapshot(snapshotsQuery, (snapshot) => {
+      const arr = snapshot.docs.map((d) => d.data().price as number).reverse();
+      setPoints(arr);
     });
 
     return () => unsubscribe();
@@ -100,6 +120,41 @@ export default function AssetPage() {
               <div style={{ fontSize: "1.5em", fontWeight: "bold" }}>{consensus.avgConfidence}</div>
             </div>
           </div>
+        </div>
+      )}
+
+      {points.length > 1 && (
+        <div style={{ marginBottom: 24 }}>
+          <h3 style={{ marginBottom: 12 }}>Price History</h3>
+          <svg
+            width="280"
+            height="60"
+            style={{
+              background: "#1a1a1a",
+              border: "1px solid #333",
+              borderRadius: 8,
+              padding: 8,
+            }}
+          >
+            {(() => {
+              const min = Math.min(...points);
+              const max = Math.max(...points);
+              const norm = (v: number) =>
+                max === min ? 30 : 60 - ((v - min) / (max - min)) * 60;
+              const step = 280 / (points.length - 1);
+              const d = points.map((v, i) => `${i === 0 ? "M" : "L"} ${i * step} ${norm(v)}`).join(" ");
+              return (
+                <path
+                  d={d}
+                  fill="none"
+                  stroke="#6366f1"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                />
+              );
+            })()}
+          </svg>
         </div>
       )}
 
